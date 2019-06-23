@@ -11,21 +11,21 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"hash/crc64"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/gravwell/ingest"
 	"github.com/gravwell/ingest/entry"
 	"github.com/gravwell/ingesters/args"
+	"github.com/gravwell/ingesters/utils"
 	"github.com/gravwell/ingesters/version"
 	"github.com/gravwell/timegrinder"
 )
@@ -48,8 +48,7 @@ var (
 	quotable  = flag.Bool("quotable-lines", false, "Allow lines to contain quoted newlines")
 	blockSize = flag.Int("block-size", 0, "Optimized ingest using blocks, 0 disables")
 	status    = flag.Bool("status", false, "Output ingest rate stats as we go")
-	srcOvr    = flag.Uint64("source-override", 0, "Override source with an ID")
-	srcHash   = flag.Bool("source-file-hash", false, "Set 64bit crc64 hash of input file in source")
+	srcOvr    = flag.String("source-override", ``, "Override source")
 
 	nlBytes          = []byte("\n")
 	count            uint64
@@ -80,17 +79,11 @@ func init() {
 	if *blockSize > 0 {
 		bsize = *blockSize
 	}
-	if *srcOvr > 0 {
-		bb := make([]byte, 16)
-		binary.BigEndian.PutUint64(bb, *srcOvr)
-		srcOverride = net.IP(bb)
-	}
-	if *srcHash {
-		//if not overriding, then make an empty has
-		if *srcOvr == 0 {
-			srcOverride = net.IP(make([]byte, 16))
+	if *srcOvr != `` {
+		var err error
+		if srcOverride, err = utils.ParseSource(*srcOvr); err != nil {
+			log.Fatalf("Invalid source: %v", err)
 		}
-		crcTable = crc64.MakeTable(crc64.ECMA)
 	}
 }
 
@@ -212,11 +205,20 @@ func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag, 
 			}
 		}
 	}
+	var src net.IP
+	var err error
+	if src, err = igst.SourceIP(); err != nil {
+		return err
+	}
+	if srcOverride != nil {
+		src = srcOverride
+	}
 	start := time.Now()
 
 	brdr := bufio.NewReader(flist)
 	var i int
 	for {
+		lsrc := src
 		i++
 		ln, isPrefix, err := brdr.ReadLine()
 		if err != nil {
@@ -229,16 +231,26 @@ func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag, 
 			log.Printf("File list line %d is too long, skipping\n", i)
 			continue
 		}
+		//attempt to split the file, check for a src override hash
+		if bits := strings.Split(string(ln), "\t"); len(bits) == 2 {
+			ln = []byte(bits[0])
+			//attempt to parse the source override as a hash
+			if lsrc, err = utils.ParseSource(bits[1]); err != nil {
+				log.Println("Failed to parse source override", bits[1])
+				lsrc = src
+			}
+		}
+
 		if *fileinfo {
 			log.Println("Processing", string(ln))
 		}
 		//get a handle on the input file with a wrapped decompressor if needed
-		fin, err := OpenFileReader(string(ln))
+		fin, err := utils.OpenBufferedFileReader(string(ln), 8192)
 		if err != nil {
 			log.Printf("Failed to open %s: %v\n", ln, err)
 			continue
 		}
-		if err = ingestFile(fin, igst, tag, tg); err != nil {
+		if err = ingestFile(fin, igst, tag, tg, lsrc); err != nil {
 			log.Printf("Failed to ingest %s: %v\n", ln, err)
 			fin.Close()
 			continue
@@ -252,36 +264,12 @@ func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag, 
 	return nil
 }
 
-func ingestFile(fin io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag, tg *timegrinder.TimeGrinder) error {
+func ingestFile(fin io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag, tg *timegrinder.TimeGrinder, src net.IP) error {
 	var bts []byte
 	var ts time.Time
 	var ok bool
 	var err error
 	var blk []*entry.Entry
-	src := srcOverride
-	if src == nil {
-		var err error
-		if src, err = igst.SourceIP(); err != nil {
-			return err
-		}
-	}
-	if *srcHash {
-		//create a copy of the src
-		var tsrc net.IP
-		tsrc = append(tsrc, src...)
-		src = tsrc
-
-		//read the entire file into a byte buffer
-		buff, err := ioutil.ReadAll(fin)
-		if err != nil {
-			return err
-		}
-		//generate a crc64 hash of the buffer, using nil table
-		v := crc64.Checksum(buff, crcTable)
-		binary.BigEndian.PutUint64(src[8:], v)
-		fin = bytes.NewBuffer(buff)
-	}
-
 	if bsize > 0 {
 		blk = make([]*entry.Entry, 0, bsize)
 	}
